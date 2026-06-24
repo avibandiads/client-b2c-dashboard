@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { fetchAccountInsights } from "@/lib/facebook";
+import { fetchCampaignInsights as fetchAccountInsights } from "@/lib/facebook";
 import type { ApiResponse } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -34,14 +34,14 @@ export async function GET(req: NextRequest) {
     .filter(Boolean);
 
   const results = await Promise.allSettled(
-    accountIds.map((id) => fetchAccountInsights(id, datePreset, token))
+    accountIds.map(async (id) => {
+      const result = await fetchAccountInsights(id, datePreset, token);
+      return result.accountGroup;
+    })
   );
 
   const data = results
-    .filter(
-      (r): r is PromiseFulfilledResult<Awaited<ReturnType<typeof fetchAccountInsights>>> =>
-        r.status === "fulfilled"
-    )
+    .filter((r): r is PromiseFulfilledResult<Awaited<ReturnType<typeof fetchAccountInsights>>["accountGroup"]> => r.status === "fulfilled")
     .map((r) => r.value);
 
   const failed = results.filter((r) => r.status === "rejected");

@@ -2,35 +2,79 @@ import type { AccountGroup, CampaignRow } from "./types";
 
 const FB_API = "https://graph.facebook.com/v19.0";
 
-const ACCOUNT_NAMES: Record<string, string> = {
-  act_1508443064618006: "Ashley Homes",
-  act_1460663760738532: "Amba Homes",
-  act_205945197288862: "Ad Account 1",
-  act_404762827188746: "Showroom Windows & Doors",
-  act_3823605791197742: "Gold Standard Bathrooms",
-  act_1914952309266121: "New Bandi Ads Lead Gen",
-  act_24099973656298447: "New Amba Homes",
-  act_24852403281018487: "Heartland Remodeling",
-  act_2021251812050853: "Cabinet Creations Plus",
-  act_1467325234789304: "Midway Remodeling",
-  act_3783307961971899: "Alamo City Exteriors and Baths",
-  act_3613277475476712: "Inside Out Home Solutions",
-  act_1900028590678897: "MulchMasters MN",
-  act_804459515609876: "Top Notch Construction",
-  act_1376496411033926: "Marblecast of Michigan",
-  act_1510374447243090: "Kustom Kitchens",
-  act_28389345204035132: "UpRight Restorations",
-  act_2345319459291850: "Apex Shower & Bath",
-  act_919498947716208: "Polaris Bath",
-  act_2719181351815196: "Ances Stone",
-};
-
 interface FbAction {
   action_type: string;
   value: string;
 }
 
-interface FbInsight {
+// ── Account-level overview (one record per account) ──────────────────────────
+
+interface FbAccountInsight {
+  spend: string;
+  impressions: string;
+  link_clicks?: string;
+  cpm?: string;
+  frequency?: string;
+  actions?: FbAction[];
+}
+
+export interface FbAccountMetrics {
+  adSpend: number;
+  leads: number;
+  linkClicks: number;
+  impressions: number;
+  cpm: number | null;
+  frequency: number | null;
+  ctr: number | null;   // calculated: link_clicks / impressions * 100
+  cpc: number | null;   // calculated: spend / link_clicks
+}
+
+export async function fetchAccountMetrics(
+  rawAccountId: string,
+  datePreset: string,
+  token: string,
+): Promise<FbAccountMetrics> {
+  const accountId = rawAccountId.trim().startsWith("act_")
+    ? rawAccountId.trim()
+    : `act_${rawAccountId.trim()}`;
+
+  const params = new URLSearchParams({
+    level: "account",
+    fields: "spend,impressions,inline_link_clicks,cpm,frequency,actions",
+    date_preset: datePreset,
+    access_token: token,
+  });
+
+  const res = await fetch(`${FB_API}/${accountId}/insights?${params}`, {
+    cache: "no-store",
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Facebook API error for ${accountId}: ${res.status} ${body}`);
+  }
+
+  const json = await res.json();
+  const row: FbAccountInsight = json.data?.[0] ?? {};
+
+  const adSpend = parseFloat(row.spend ?? "0");
+  const impressions = parseInt(row.impressions ?? "0", 10);
+  const linkClicks = parseInt((row as { inline_link_clicks?: string }).inline_link_clicks ?? "0", 10);
+  const cpm = row.cpm ? parseFloat(row.cpm) : null;
+  const frequency = row.frequency ? parseFloat(row.frequency) : null;
+  const leads = row.actions?.find((a) => a.action_type === "lead")
+    ? parseInt(row.actions.find((a) => a.action_type === "lead")!.value, 10)
+    : 0;
+
+  const ctr = impressions > 0 ? (linkClicks / impressions) * 100 : null;
+  const cpc = linkClicks > 0 ? adSpend / linkClicks : null;
+
+  return { adSpend, leads, linkClicks, impressions, cpm, frequency, ctr, cpc };
+}
+
+// ── Campaign-level detail (for the detail page) ───────────────────────────────
+
+interface FbCampaignInsight {
   campaign_id: string;
   campaign_name: string;
   spend: string;
@@ -38,15 +82,15 @@ interface FbInsight {
 }
 
 interface FbInsightsResponse {
-  data: FbInsight[];
+  data: FbCampaignInsight[];
   paging?: { cursors: { after: string }; next?: string };
 }
 
-export async function fetchAccountInsights(
+export async function fetchCampaignInsights(
   rawAccountId: string,
   datePreset: string,
-  token: string
-): Promise<AccountGroup> {
+  token: string,
+): Promise<{ campaigns: CampaignRow[]; accountGroup: AccountGroup }> {
   const accountId = rawAccountId.trim().startsWith("act_")
     ? rawAccountId.trim()
     : `act_${rawAccountId.trim()}`;
@@ -74,22 +118,76 @@ export async function fetchAccountInsights(
     const spend = parseFloat(insight.spend ?? "0");
     const leadAction = insight.actions?.find((a) => a.action_type === "lead");
     const leads = leadAction ? parseInt(leadAction.value, 10) : 0;
-    const cpl = leads > 0 ? spend / leads : null;
-
     return {
       campaignId: insight.campaign_id,
       campaignName: insight.campaign_name,
       spend,
       leads,
-      cpl,
+      cpl: leads > 0 ? spend / leads : null,
     };
   });
 
-  const totalSpend = campaigns.reduce((sum, c) => sum + c.spend, 0);
-  const totalLeads = campaigns.reduce((sum, c) => sum + c.leads, 0);
-  const avgCpl = totalLeads > 0 ? totalSpend / totalLeads : null;
+  const totalSpend = campaigns.reduce((s, c) => s + c.spend, 0);
+  const totalLeads = campaigns.reduce((s, c) => s + c.leads, 0);
 
-  const accountName = ACCOUNT_NAMES[accountId] ?? accountId;
+  return {
+    campaigns,
+    accountGroup: {
+      accountId,
+      accountName: accountId,
+      campaigns,
+      totalSpend,
+      totalLeads,
+      avgCpl: totalLeads > 0 ? totalSpend / totalLeads : null,
+    },
+  };
+}
 
-  return { accountId, accountName, campaigns, totalSpend, totalLeads, avgCpl };
+// ── Daily time-series (for trend charts) ─────────────────────────────────────
+
+export interface FbDailyRow {
+  date: string;
+  spend: number;
+  leads: number;
+  linkClicks: number;
+}
+
+export async function fetchDailyInsights(
+  rawAccountId: string,
+  startDate: string, // YYYY-MM-DD
+  endDate: string,   // YYYY-MM-DD
+  token: string,
+): Promise<FbDailyRow[]> {
+  const accountId = rawAccountId.trim().startsWith("act_")
+    ? rawAccountId.trim()
+    : `act_${rawAccountId.trim()}`;
+
+  const params = new URLSearchParams({
+    level: "account",
+    fields: "spend,inline_link_clicks,actions",
+    time_range: JSON.stringify({ since: startDate, until: endDate }),
+    time_increment: "1",
+    access_token: token,
+    limit: "90",
+  });
+
+  const res = await fetch(`${FB_API}/${accountId}/insights?${params}`, {
+    cache: "no-store",
+  });
+
+  if (!res.ok) {
+    console.error(`FB daily fetch error for ${accountId}: ${res.status}`);
+    return [];
+  }
+
+  const json = await res.json();
+
+  return (json.data ?? []).map((row: FbCampaignInsight & { date_start: string; link_clicks?: string }) => {
+    const spend = parseFloat(row.spend ?? "0");
+    const linkClicks = parseInt((row as { inline_link_clicks?: string }).inline_link_clicks ?? "0", 10);
+    const leads = row.actions?.find((a) => a.action_type === "lead")
+      ? parseInt(row.actions.find((a) => a.action_type === "lead")!.value, 10)
+      : 0;
+    return { date: (row as { date_start: string }).date_start, spend, leads, linkClicks };
+  });
 }
